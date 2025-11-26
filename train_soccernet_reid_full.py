@@ -9,7 +9,8 @@ from PIL import Image
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
+import json
 
 import timm
 import pytorch_lightning as pl
@@ -209,11 +210,17 @@ def build_transform(train=True):
         ])
 
 '''
-Klasa przygotowująca dane dla sieci.
-    - Znaleźć wszystkie obrazy w folderze (np. train)
-    - Sparsować ich nazwy, by znać kto to i z jakiej akcji
-    - Nadać unikalne etykiety liczbowo (labele)
-    - Przygotować dane + augmentacje
+Klasa przygotowująca dane dla sieci
+Wersja z wykorzystaniem plików JSON
+train_bbox_info.json / valid_bbox_info.json
+
+Kroki
+    - wczytaj metadane z JSON
+    - zbuduj ścieżkę do obrazka z pól JSON
+    - odfiltruj mniej ważne klasy (np Staff)
+    - nadaj etykiety ID w obrębie całego zbioru
+    - zbuduj mapę action_idx -> lista indeksów
+      do późniejszego samplingu per-akcja
 '''
 class SoccerNetReID(Dataset):
     # dataset do ReID
@@ -221,33 +228,145 @@ class SoccerNetReID(Dataset):
     def __init__(self, root, split="train", transform=None):
         self.root = Path(root)
         self.split = split  # Podfolder
-        split_dir = self.root / split   # Pełna ścieżka (np. data/reid-2023/train)
+        split_dir = self.root / split   # np. dataSoccerNet/reid-2023/train
         if not split_dir.exists():
             raise FileNotFoundError(f"brak katalogu: {split_dir}")
 
-        all_imgs = list_images(split_dir)   # Przeszukiwanie plików po podfolderach (np. england_epl/2015-2016/...)
+        '''
+        Plik z metadanymi bbox z JSON
+        train  -> train/train_bbox_info.json
+        valid  -> valid/bbox_info.json
+        test   -> test/bbox_info.json
+        challenge na razie bez JSON
+        '''
+        json_dir = self.root / split
 
-        # parsowane nazw plików
+        if split == "train":
+            json_name = "train_bbox_info.json"
+        if split == "challenge":
+            raise NotImplementedError("challenge bez JSON – na razie pomijamy")
+        else:
+            json_name = "bbox_info.json"
+
+        json_path = json_dir / json_name
+
+        if not json_path.exists():
+            raise FileNotFoundError(f"brak pliku JSON: {json_path}")
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            meta_all = json.load(f)
+
+        '''
+        Lista do przechowania próbek
+        Każdy element:
+            (pełna_ścieżka_png, klucz_ID, action_idx, klasa_tekstowa)
+        '''
         samples = []
-        for p in all_imgs:
-            meta = parse_filename(p.stem)
-            if meta is None:
-                continue
-            key = f"{meta['action_idx']}|{meta['person_uid']}"  # Unikalny id osoby w konkretnej akcji
-            samples.append((str(p), key, int(meta["action_idx"])))  # Tworzenie listy trójek ścieżka, klucz, akcja (np. ("path/to/img.png", "12|3456", 12)).
 
-        # remap klucza na int "12|3456" -> 0, "12|7890" -> 1. Wynik (path, label_int, action_idx)
+        '''
+        Do balansowania klas semantycznych
+        Bierzemy tylko graczy i sędziów
+        Pomijamy np Staff itp
+        '''
+        allowed_classes = {
+            "Player_team_left",
+            "Player_team_right",
+            "Goalkeeper_team_left",
+            "Goalkeeper_team_right",
+            "Main_referee",
+            "Side_referee",
+            "Goalkeeper_team_right_unknown",
+            "Player_team_unknown_1",
+            "Player_team_unknown_2",
+        }
+
+        for _, info in meta_all.items():
+            clazz = info["clazz"]
+
+            # filtr klas semantycznych
+            if clazz not in allowed_classes:
+                continue
+
+            bbox_idx = info["bbox_idx"]
+            action_idx = info["action_idx"]
+            person_uid = info["person_uid"]
+            frame_idx = info["frame_idx"]
+            rel_path = info["relative_path"]
+            pid_in_action = info["id"]
+            uai = info["UAI"]
+            h = info["height"]
+            w = info["width"]
+
+            # id może być None lub literą
+            pid_str = str(pid_in_action)
+
+            '''
+            Nazwa pliku jest zgodna ze specyfikacją
+            <bbox_idx>-<action_idx>-<person_uid>-<frame_idx>
+            -<clazz>-<ID>-<UAI>-<height>x<width>.png
+            '''
+            file_name = (
+                f"{bbox_idx}-"
+                f"{action_idx}-"
+                f"{person_uid}-"
+                f"{frame_idx}-"
+                f"{clazz}-"
+                f"{pid_str}-"
+                f"{uai}-"
+                f"{h}x{w}.png"
+            )
+
+            img_path = split_dir / rel_path / file_name
+
+            # na wszelki wypadek pomijamy brakujące pliki
+            if not img_path.exists():
+                continue
+
+            '''
+            Klucz ID
+            Tożsamość ważna tylko w obrębie jednej akcji
+            Dlatego składamy:
+                action_idx | person_uid
+            '''
+            key = f"{action_idx}|{person_uid}"
+            samples.append(
+                (str(img_path), key, int(action_idx), clazz)
+            )
+
+        if not samples:
+            raise RuntimeError(
+                f"Brak próbek po filtracji w {split}"
+            )
+
+        '''
+        Remap klucza ID na int
+        "12|3456" -> 0
+        "12|7890" -> 1
+        itd
+        Wynik końcowy:
+            items = (path, label_int, action_idx, clazz)
+        '''
         label_to_int = {}
         items = []
-        for path, key, act in samples:
+        for path, key, act, clazz in samples:
             if key not in label_to_int:
                 label_to_int[key] = len(label_to_int)
-            items.append((path, label_to_int[key], act))
+            items.append((path, label_to_int[key], act, clazz))
 
         # zapis pól do klasy
-        self.items = items  # Główna lista z danymi
-        self.labels = [y for _, y, _ in items]  # Lista etykiet liczbowych (używana przez sampler PK)
-        self.actions = [a for *_, a in items]   # Lista indeksów akcji
+        self.items = items  # główna lista z danymi
+        self.labels = [y for _, y, _, _ in items]   # etykiety ID
+        self.actions = [a for _, _, a, _ in items]  # indeksy akcji
+        self.classes = [c for *_, c in items]       # klasy semantyczne
+
+        '''
+        Mapa akcji do indeksów datasetu
+        action_idx -> [i0, i1, i2, ...]
+        Przydatne do samplingu per-akcja
+        '''
+        self.action_to_indices = {}
+        for idx, (_, _, act, _) in enumerate(items):
+            self.action_to_indices.setdefault(act, []).append(idx)
 
         # transformacje
         if transform is None:
@@ -255,7 +374,8 @@ class SoccerNetReID(Dataset):
         self.transform = transform
 
     '''
-    Zwraca liczbę wszystkich próbek, by DataLoader widział ile kroków ma epoka
+    Zwraca liczbę wszystkich próbek
+    by DataLoader widział ile kroków ma epoka
     '''
     def __len__(self):
         return len(self.items)
@@ -263,21 +383,115 @@ class SoccerNetReID(Dataset):
     '''
     - wybiera rekord po indeksie
     - otwiera obraz z dysku przez PIL.Image.open
-    - konwertuje do RGB (na wypadek, gdyby był grayscale)
-    - stosuje transformacje (augmentacje lub normalizację)
-    
+    - konwertuje do RGB
+    - stosuje transformacje
     Zwraca:
-    - img: tensor 3xHxW
-    - y: etykieta (int, ID gracza)
-    - act: numer akcji (do analizy kontekstu)
-    - path: ścieżka (przydatna np. do ewaluacji i logów)
+        img  tensor 3xHxW
+        y    etykieta (int, ID gracza)
+        act  numer akcji
+        path ścieżka
     '''
     def __getitem__(self, idx):
-        path, y, act = self.items[idx]
+        path, y, act, clazz = self.items[idx]
         img = Image.open(path).convert("RGB")
         img = self.transform(img)
         return img, y, act, path
+    
+'''
+Sampler akcyjny z PK w obrębie jednej akcji
 
+Założenia
+    - każdy batch pochodzi z jednej akcji
+    - w batchu jest P identytetów (graczy)
+    - dla każdej tożsamości losujemy K przykładów
+    - batch_size = P x K
+
+Dzięki temu
+    - pozytywy i negatywy pochodzą z tej samej akcji
+    - model uczy się trudnych przypadków replayów
+'''
+class ActionPKSampler(Sampler):
+    def __init__(self, labels, actions, action_to_indices,
+                 batch_size, K):
+        super().__init__()
+        self.labels = np.asarray(labels, dtype=np.int64)
+        self.actions = np.asarray(actions, dtype=np.int64)
+        self.action_to_indices = action_to_indices
+        self.batch_size = batch_size
+        self.K = K
+        self.P = batch_size // K
+
+        '''
+        Dla każdej akcji budujemy mapę
+        label_int -> lista indeksów w tej akcji
+        '''
+        self.action_label_to_indices = {}
+        for act, idxs in action_to_indices.items():
+            lab2idx = {}
+            for i in idxs:
+                y = int(self.labels[i])
+                lab2idx.setdefault(y, []).append(i)
+            self.action_label_to_indices[act] = lab2idx
+
+        '''
+        Lista akcji które mają sens
+        co najmniej 2 różne ID w akcji
+        inaczej ReID byłoby zbyt słabe
+        '''
+        self.valid_actions = [
+            act for act, lab2idx
+            in self.action_label_to_indices.items()
+            if len(lab2idx) >= 2
+        ]
+
+        if not self.valid_actions:
+            raise RuntimeError("Brak akcji z >=2 ID")
+
+        # przybliżona liczba batchy na epokę
+        self.num_batches = len(self.labels) // self.batch_size
+
+    def __len__(self):
+        return self.num_batches * self.batch_size
+
+    def __iter__(self):
+        rng = np.random.default_rng()
+        result_indices = []
+
+        for _ in range(self.num_batches):
+            # wybierz losową akcję
+            act = int(rng.choice(self.valid_actions))
+            lab2idx = self.action_label_to_indices[act]
+            labels_in_action = list(lab2idx.keys())
+
+            # wybierz P tożsamości w tej akcji
+            if len(labels_in_action) >= self.P:
+                chosen_labels = rng.choice(
+                    labels_in_action,
+                    size=self.P,
+                    replace=False,
+                )
+            else:
+                # jak za mało ID, losujemy z powtórzeniami
+                chosen_labels = rng.choice(
+                    labels_in_action,
+                    size=self.P,
+                    replace=True,
+                )
+
+            # dla każdej tożsamości losujemy K przykładów
+            for y in chosen_labels:
+                idxs = lab2idx[int(y)]
+                if len(idxs) >= self.K:
+                    chosen = rng.choice(
+                        idxs, size=self.K, replace=False
+                    )
+                else:
+                    chosen = rng.choice(
+                        idxs, size=self.K, replace=True
+                    )
+                result_indices.extend(chosen.tolist())
+
+        return iter(result_indices)
 
 # ===================== MODEL =====================
 '''
@@ -491,39 +705,32 @@ def make_loaders():
     valid_ds = SoccerNetReID(CFG.data_root, split="valid")
 
     '''
-    PK SAMPLER, jeśli możliwy
-        - P liczba klas - unikatowych zawodników w batchu
-        - K liczba przykładów (obrazów) na klasę
+    PK SAMPLER per-akcja
+        - P liczba klas ID w batchu
+        - K liczba przykładów na klasę
         - batch_size = P x K
+        - każdy batch pochodzi z jednej akcji
     '''
     K = CFG.K   # liczba próbek na klasę
-    bs = CFG.batch_size # rozmiar batcha
-    sampler = None
-    use_pk = False
-    try:
-        assert bs % K == 0  # sprawdzenie, czy batch dzieli się na K
-        '''
-            - train_ds.labels - lista etykiet z datasetu ([0, 0, 1, 1, 1, 2, 3, ...])
-            - m - liczba prrzykładów na klasę ile ma wziąć z datasetu
-            - length_before_new_iter - długość datasetu (ile iteracji zanim sampler się odświezy)
-        '''
-        sampler = MPerClassSampler(
-            train_ds.labels, m=K, batch_size=bs,
-            length_before_new_iter=len(train_ds)
-        )
-        use_pk = True
-    except Exception as e:
-        print("PK sampler wyłączony:", e)   # jeśli błąd to zamiast samplera uzywamy shullfe=True
+    bs = CFG.batch_size  # rozmiar batcha
+
+    sampler = ActionPKSampler(
+        labels=train_ds.labels,
+        actions=train_ds.actions,
+        action_to_indices=train_ds.action_to_indices,
+        batch_size=bs,
+        K=K,
+    )
 
     '''
     Wspólne parametry dla wszystkich loaderów
-    | parametr             | opis                                                         |
-    | -------------------- | ------------------------------------------------------------ |
-    | `num_workers`        | liczba wątków do ładowania danych (4 → 4 równoległe wątki)   |
-    | `pin_memory=True`    | przyspiesza transfer danych CPU→GPU                          |
-    | `drop_last=True`     | odrzuca ostatni batch, jeśli niepełny                        |
-    | `persistent_workers` | utrzymuje procesy robocze między epokami (oszczędność czasu) |
 
+    | parametr             | opis                          |
+    | -------------------- | ----------------------------- |
+    | num_workers          | liczba wątków do ładowania    |
+    | pin_memory           | szybki transfer CPU→GPU (CUDA)|
+    | drop_last=True       | odrzuca niepełny ostatni batch|
+    | persistent_workers   | utrzymuje wątki między epokami
     '''
     common = dict(
         num_workers=CFG.num_workers,
@@ -532,21 +739,19 @@ def make_loaders():
         persistent_workers=(CFG.num_workers > 0),
     )
 
-    # loader train z samplerem lub shuffle
-    if use_pk:
-        train_loader = DataLoader(
-            train_ds, batch_size=bs, sampler=sampler, **common
-        )
-    else:
-        train_loader = DataLoader(
-            train_ds, batch_size=bs, shuffle=True, **common
-        )
+    # loader train z naszym samplerem akcyjnym
+    train_loader = DataLoader(
+        train_ds, batch_size=bs, sampler=sampler, **common
+    )
 
-    # loader valid bez shuffle i bez PK Samplera
+    # loader valid bez shuffle i bez PK samplera
     val_loader = DataLoader(
-        valid_ds, batch_size=bs, shuffle=False,
-        num_workers=CFG.num_workers, pin_memory=torch.cuda.is_available(),
-        persistent_workers=False
+        valid_ds,
+        batch_size=bs,
+        shuffle=False,
+        num_workers=CFG.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=False,
     )
 
     print(f"train items: {len(train_ds)} | valid items: {len(valid_ds)}")
