@@ -1,6 +1,7 @@
-# ewaluacja ReID dla SoccerNet
-# działa z checkpointem z treningu
+# ewaluacja ReID dla SoccerNet v3 (JSON)
+# wykorzystuje checkpoint z treningu
 
+import json
 import numpy as np
 from pathlib import Path
 from typing import Tuple
@@ -11,12 +12,14 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from torchvision import transforms
 
-# importuj z pliku uzytego do trenowania
+# import z pliku treningowego
 from train_soccernet_reid_full import (
-    ReIDLit, CFG, parse_filename
+    ReIDLit,
+    CFG,
 )
 
-# czysty transform do ewaluacji
+# ===================== TRANSFORM =====================
+
 def build_eval_transform():
     H, W = CFG.image_size
     return transforms.Compose([
@@ -28,85 +31,218 @@ def build_eval_transform():
         ),
     ])
 
-class ReIDSplit(Dataset):
-    def __init__(self, root: str, split: str = "valid"):
+# ===================== DATASET (JSON, QUERY/GALLERY) =====================
+
+class ReIDJSONSplit(Dataset):
+    """
+    Dataset do ewaluacji
+    Korzysta z bbox_info.json i podziału na
+    query / gallery w katalogach valid / test
+
+    label = action_idx | person_uid
+    """
+    def __init__(self, root: str,
+                 split: str = "valid",
+                 group: str = "query"):
+        """
+        root  -> np "dataSoccerNet/reid-2023"
+        split -> "valid" lub "test"
+        group -> "query" lub "gallery"
+        """
         self.root = Path(root)
+        self.split = split
+        self.group = group
+
         split_dir = self.root / split
         if not split_dir.exists():
-            raise FileNotFoundError(f"Brak katalogu: {split_dir}")
-        paths = []
-        for ext in ("*.png", "*.jpg", "*.jpeg"):
-            paths += list(split_dir.rglob(ext))
-        items = []
-        for p in paths:
-            meta = parse_filename(p.stem)
-            if meta is None:
+            raise FileNotFoundError(f"Brak katalogu split: {split_dir}")
+
+        # ścieżka do JSON
+        if split == "train":
+            json_name = "train_bbox_info.json"
+        else:
+            json_name = "bbox_info.json"
+
+        json_path = split_dir / json_name
+        if not json_path.exists():
+            raise FileNotFoundError(f"Brak pliku JSON: {json_path}")
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            meta_root = json.load(f)
+
+        # train ma płaski dict
+        # valid/test mają {"query": {...}, "gallery": {...}}
+        if split in ("valid", "test"):
+            if group not in meta_root:
+                raise KeyError(f"Brak grupy {group} w {json_path}")
+            meta_all = meta_root[group]
+            base_dir = split_dir / group
+        else:
+            meta_all = meta_root
+            base_dir = split_dir
+
+        # klasy jak w treningu
+        allowed_classes = {
+            "Player_team_left",
+            "Player_team_right",
+            "Goalkeeper_team_left",
+            "Goalkeeper_team_right",
+            "Main_referee",
+            "Side_referee",
+            "Goalkeeper_team_unknown",
+            "Player_team_unknown_1",
+            "Player_team_unknown_2",
+        }
+
+        samples = []
+        missing = 0
+        total = 0
+
+        for _, info in meta_all.items():
+            clazz = info["clazz"]
+            if clazz not in allowed_classes:
                 continue
-            key = f"{meta['action_idx']}|{meta['person_uid']}"
-            items.append((str(p), key, int(meta["action_idx"])))
 
-        lab2int = {}
-        mapped = []
-        for path, key, act in items:
-            if key not in lab2int:
-                lab2int[key] = len(lab2int)
-            mapped.append((path, lab2int[key], act))
+            bbox_idx = info["bbox_idx"]
+            action_idx = info["action_idx"]
+            person_uid = info["person_uid"]
+            frame_idx = info["frame_idx"]
+            rel_path = info["relative_path"]
+            pid_in_action = info["id"]
+            uai = info["UAI"]
+            h = info["height"]
+            w = info["width"]
 
-        self.items = mapped
-        self.labels = [y for _, y, _ in mapped]
-        self.actions = [a for *_, a in mapped]
+            pid_str = str(pid_in_action)
+
+            file_name = (
+                f"{bbox_idx}-"
+                f"{action_idx}-"
+                f"{person_uid}-"
+                f"{frame_idx}-"
+                f"{clazz}-"
+                f"{pid_str}-"
+                f"{uai}-"
+                f"{h}x{w}.png"
+            )
+
+            img_path = base_dir / rel_path / file_name
+            total += 1
+
+            if not img_path.exists():
+                missing += 1
+                continue
+
+            key = f"{action_idx}|{person_uid}"
+            samples.append(
+                (str(img_path), key, int(action_idx))
+            )
+
+        print(
+            f"[{split}:{group}] total={total} "
+            f"missing={missing} samples={len(samples)}"
+        )
+
+        if not samples:
+            raise RuntimeError(
+                f"Brak próbek w {split}:{group} po filtracji"
+            )
+
+        # remap key -> int label
+        label_to_int = {}
+        items = []
+        for path, key, act in samples:
+            if key not in label_to_int:
+                label_to_int[key] = len(label_to_int)
+            items.append((path, label_to_int[key], act))
+
+        self.items = items
+        self.labels = [y for _, y, _ in items]
+        self.actions = [a for *_, a in items]
         self.tfm = build_eval_transform()
 
     def __len__(self):
         return len(self.items)
 
     def __getitem__(self, idx):
-        p, y, a = self.items[idx]
-        img = Image.open(p).convert("RGB")
+        path, y, act = self.items[idx]
+        img = Image.open(path).convert("RGB")
         img = self.tfm(img)
-        return img, y, a, p
+        return img, y, act, path
 
-def cmc_map_for_action(emb: torch.Tensor, labels: np.ndarray) -> Tuple[np.ndarray, float]:
-    emb = F.normalize(emb, p=2, dim=1)
-    sim = emb @ emb.t()
-    N = emb.size(0)
-    cmc_counts = np.zeros(N, dtype=np.int64)
+# ===================== METRYKI CMC + mAP =====================
+
+def cmc_map_query_gallery(
+    q_emb: torch.Tensor,
+    q_labels: np.ndarray,
+    g_emb: torch.Tensor,
+    g_labels: np.ndarray
+) -> Tuple[np.ndarray, float]:
+    """
+    Standardowe ReID
+    szukamy w gallery dla każdego query
+    """
+
+    # upewniamy się że embeddingi są L2
+    q_emb = F.normalize(q_emb, p=2, dim=1)
+    g_emb = F.normalize(g_emb, p=2, dim=1)
+
+    sim = q_emb @ g_emb.t()   # cosinus
+    num_q, num_g = sim.shape
+
+    cmc_counts = np.zeros(num_g, dtype=np.int64)
     ap_list = []
-    for i in range(N):
-        s = sim[i].clone()
-        s[i] = -1e9
+
+    for i in range(num_q):
+        s = sim[i]
+
+        # sortujemy gallery po podobieństwie
         order = torch.argsort(s, descending=True).cpu().numpy()
-        rel = (labels[order] == labels[i]).astype(np.int64)
+
+        rel = (g_labels[order] == q_labels[i]).astype(np.int64)
         if rel.sum() == 0:
+            # brak pozytywnych w gallery
             continue
+
+        # CMC
         first_hit = np.argmax(rel)
         cmc_counts[first_hit:] += 1
+
+        # AP
         cumsum = rel.cumsum()
-        ranks = np.where(rel == 1)[0]
-        prec_at_k = cumsum[ranks] / (ranks + 1)
+        pos_idx = np.where(rel == 1)[0]
+        prec_at_k = cumsum[pos_idx] / (pos_idx + 1)
         ap_list.append(prec_at_k.mean())
-    cmc = cmc_counts / max(1, labels.shape[0])
+
+    cmc = cmc_counts / max(1, num_q)
     mAP = float(np.mean(ap_list)) if ap_list else 0.0
     return cmc, mAP
 
-def evaluate(split_ds: ReIDSplit, model: ReIDLit, bs: int = 128, num_workers: int = 0):
+# ===================== EKSTRAKCJA EMBEDDINGÓW =====================
+
+def extract_embeddings(
+    ds: Dataset,
+    model: ReIDLit,
+    device: str,
+    bs: int = 128,
+    num_workers: int = 0,
+):
     loader = DataLoader(
-        split_ds, batch_size=bs, shuffle=False,
-        num_workers=num_workers, pin_memory=True
+        ds,
+        batch_size=bs,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
     )
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif torch.backends.mps.is_available():
-        device = "mps"      # GPU Apple
-    else:
-        device = "cpu"
-    model.eval().to(device)
 
     all_emb, all_lab, all_act = [], [], []
+
+    model.eval().to(device)
+
     with torch.no_grad():
         for x, y, act, _ in loader:
             x = x.to(device, non_blocking=True)
-            e = model(x)
+            e = model(x)  # ReIDLit.forward -> embedding
             all_emb.append(e.cpu())
             all_lab.append(y.numpy())
             all_act.append(act.numpy())
@@ -114,58 +250,93 @@ def evaluate(split_ds: ReIDSplit, model: ReIDLit, bs: int = 128, num_workers: in
     emb = torch.cat(all_emb, dim=0)
     labels = np.concatenate(all_lab, axis=0)
     actions = np.concatenate(all_act, axis=0)
+    return emb, labels, actions
 
-    uniq = np.unique(actions)
-    cmc_sum, ap_sum, valid = None, 0.0, 0
-    for a in uniq:
-        idx = np.where(actions == a)[0]
-        if len(idx) < 2:
-            continue
-        cmc, ap = cmc_map_for_action(emb[idx], labels[idx])
-        cmc_sum = cmc if cmc_sum is None else cmc_sum[:len(cmc)] + cmc[:len(cmc_sum)]
-        ap_sum += ap
-        valid += 1
+# ===================== GŁÓWNA FUNKCJA EWALUACJI =====================
 
-    if valid == 0:
-        raise RuntimeError("Brak akcji do ewaluacji")
+def evaluate(
+    root: str,
+    model: ReIDLit,
+    split: str = "valid",
+    bs: int = 128,
+    num_workers: int = 0,
+):
+    # wybór urządzenia
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
 
-    cmc_avg = cmc_sum / valid
+    # query i gallery jako osobne datasety
+    ds_query = ReIDJSONSplit(root, split=split, group="query")
+    ds_gallery = ReIDJSONSplit(root, split=split, group="gallery")
+
+    q_emb, q_labels, _ = extract_embeddings(
+        ds_query, model, device, bs=bs, num_workers=num_workers
+    )
+    g_emb, g_labels, _ = extract_embeddings(
+        ds_gallery, model, device, bs=bs, num_workers=num_workers
+    )
+
+    cmc, mAP = cmc_map_query_gallery(
+        q_emb, q_labels, g_emb, g_labels
+    )
+
+    rank1 = float(cmc[0])
+    rank5 = float(cmc[min(4, len(cmc) - 1)])
+
     return {
-        "rank1": float(cmc_avg[0]),
-        "rank5": float(cmc_avg[min(4, len(cmc_avg)-1)]),
-        "mAP": float(ap_sum / valid),
+        "rank1": rank1,
+        "rank5": rank5,
+        "mAP": float(mAP),
     }
 
+# ===================== CHECKPOINT =====================
+
 def find_last_ckpt(ckpt_dir="checkpoints"):
-    # najnowszy po czasie modyfikacji
-    paths = sorted(Path(ckpt_dir).glob("*.ckpt"), key=lambda p: p.stat().st_mtime)
+    paths = sorted(
+        Path(ckpt_dir).glob("*.ckpt"),
+        key=lambda p: p.stat().st_mtime
+    )
     if not paths:
         raise FileNotFoundError("Nie znaleziono checkpointów")
     return str(paths[-1])
 
+# ===================== MAIN =====================
+
 def main():
-    split = "valid"
+    split = "valid"  # albo "test"
     ckpt = find_last_ckpt()
     print(f"Używam split: {split}")
     print(f"Używam ckpt:  {ckpt}")
 
-    ds = ReIDSplit(CFG.data_root, split=split)
+    model = ReIDLit.load_from_checkpoint(
+        ckpt, cfg=CFG, strict=False
+    )
 
-    model = ReIDLit.load_from_checkpoint(ckpt, cfg=CFG, strict=False)
+    nw = 0  # num_workers dla DataLoader
 
-    nw = 0
+    metrics = evaluate(
+        CFG.data_root,
+        model,
+        split=split,
+        bs=128,
+        num_workers=nw,
+    )
 
-    metrics = evaluate(ds, model, bs=128, num_workers=nw)
     print("rank-1:", metrics["rank1"])
     print("rank-5:", metrics["rank5"])
     print("mAP:", metrics["mAP"])
 
     out = Path("results")
     out.mkdir(exist_ok=True)
-    with open(out / "results_valid.txt", "w", encoding="utf-8") as f:
+    out_file = out / f"results_{split}.txt"
+    with open(out_file, "w", encoding="utf-8") as f:
         for k, v in metrics.items():
             f.write(f"{k},{v}\n")
-    print("Zapisano do results/results_valid.txt")
+    print(f"Zapisano do {out_file}")
 
 if __name__ == "__main__":
     main()
