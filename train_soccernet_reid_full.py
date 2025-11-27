@@ -228,23 +228,23 @@ class SoccerNetReID(Dataset):
     def __init__(self, root, split="train", transform=None):
         self.root = Path(root)
         self.split = split  # Podfolder
-        split_dir = self.root / split   # np. dataSoccerNet/reid-2023/train
+        split_dir = self.root / split   # np dataSoccerNet/reid-2023/train
         if not split_dir.exists():
             raise FileNotFoundError(f"brak katalogu: {split_dir}")
 
         '''
         Plik z metadanymi bbox z JSON
-        train  -> train/train_bbox_info.json
-        valid  -> valid/bbox_info.json
-        test   -> test/bbox_info.json
-        challenge na razie bez JSON
+            train  -> train/train_bbox_info.json
+            valid  -> valid/bbox_info.json
+            test   -> test/bbox_info.json
+            challenge na razie bez JSON
         '''
         json_dir = self.root / split
 
         if split == "train":
             json_name = "train_bbox_info.json"
-        if split == "challenge":
-            raise NotImplementedError("challenge bez JSON – na razie pomijamy")
+        elif split == "challenge":
+            raise NotImplementedError("challenge bez JSON")
         else:
             json_name = "bbox_info.json"
 
@@ -254,7 +254,36 @@ class SoccerNetReID(Dataset):
             raise FileNotFoundError(f"brak pliku JSON: {json_path}")
 
         with open(json_path, "r", encoding="utf-8") as f:
-            meta_all = json.load(f)
+            meta_root = json.load(f)
+
+        '''
+        Rozpakowanie struktur JSON
+            train  -> jeden słownik wpisów
+            valid  -> dwa słowniki: query i gallery
+            test   -> dwa słowniki: query i gallery
+
+        groups to lista krotek
+            (nazwa_grupy, słownik_z_wpisami)
+
+        nazwa_grupy jest
+            ""        dla train
+            "query"   dla valid/test query
+            "gallery" dla valid/test gallery
+        '''
+        groups = []
+        if split in ("valid", "test"):
+            if "query" in meta_root:
+                groups.append(("query", meta_root["query"]))
+            if "gallery" in meta_root:
+                groups.append(("gallery", meta_root["gallery"]))
+        else:
+            # train ma wszystko w jednym dict
+            groups.append(("", meta_root))
+
+        print(
+            f"[{split}] grupy w JSON:",
+            [g[0] or "root" for g in groups]
+        )
 
         '''
         Lista do przechowania próbek
@@ -275,63 +304,99 @@ class SoccerNetReID(Dataset):
             "Goalkeeper_team_right",
             "Main_referee",
             "Side_referee",
-            "Goalkeeper_team_right_unknown",
+            "Goalkeeper_team_unknown",
             "Player_team_unknown_1",
             "Player_team_unknown_2",
         }
 
-        for _, info in meta_all.items():
-            clazz = info["clazz"]
+        from collections import Counter
+        all_classes = Counter()
 
-            # filtr klas semantycznych
-            if clazz not in allowed_classes:
-                continue
+        missing = 0   # liczba brakujących plików
+        total = 0     # liczba prób po filtrach klas
 
-            bbox_idx = info["bbox_idx"]
-            action_idx = info["action_idx"]
-            person_uid = info["person_uid"]
-            frame_idx = info["frame_idx"]
-            rel_path = info["relative_path"]
-            pid_in_action = info["id"]
-            uai = info["UAI"]
-            h = info["height"]
-            w = info["width"]
-
-            # id może być None lub literą
-            pid_str = str(pid_in_action)
-
+        '''
+        Iterujemy po grupach
+        train  -> jedna grupa ""
+        valid  -> dwie grupy "query" i "gallery"
+        test   -> dwie grupy "query" i "gallery"
+        '''
+        for group_name, meta_all in groups:
             '''
-            Nazwa pliku jest zgodna ze specyfikacją
-            <bbox_idx>-<action_idx>-<person_uid>-<frame_idx>
-            -<clazz>-<ID>-<UAI>-<height>x<width>.png
+            Bazowy katalog dla tej grupy
+                train  -> .../train
+                valid  -> .../valid/query lub .../valid/gallery
+                test   -> .../test/query lub .../test/gallery
             '''
-            file_name = (
-                f"{bbox_idx}-"
-                f"{action_idx}-"
-                f"{person_uid}-"
-                f"{frame_idx}-"
-                f"{clazz}-"
-                f"{pid_str}-"
-                f"{uai}-"
-                f"{h}x{w}.png"
+            base_dir = (
+                split_dir / group_name if group_name else split_dir
             )
 
-            img_path = split_dir / rel_path / file_name
-
-            # na wszelki wypadek pomijamy brakujące pliki
-            if not img_path.exists():
-                continue
-
-            '''
-            Klucz ID
-            Tożsamość ważna tylko w obrębie jednej akcji
-            Dlatego składamy:
-                action_idx | person_uid
-            '''
-            key = f"{action_idx}|{person_uid}"
-            samples.append(
-                (str(img_path), key, int(action_idx), clazz)
+            # aktualizujemy licznik klas
+            all_classes.update(
+                info["clazz"] for info in meta_all.values()
             )
+
+            for _, info in meta_all.items():
+                clazz = info["clazz"]
+
+                # filtr klas semantycznych
+                if clazz not in allowed_classes:
+                    continue
+
+                bbox_idx = info["bbox_idx"]
+                action_idx = info["action_idx"]
+                person_uid = info["person_uid"]
+                frame_idx = info["frame_idx"]
+                rel_path = info["relative_path"]
+                pid_in_action = info["id"]
+                uai = info["UAI"]
+                h = info["height"]
+                w = info["width"]
+
+                # id może być None lub literą
+                pid_str = str(pid_in_action)
+
+                '''
+                Nazwa pliku zgodna ze specyfikacją
+                <bbox_idx>-<action_idx>-<person_uid>-<frame_idx>
+                -<clazz>-<ID>-<UAI>-<height>x<width>.png
+                '''
+                file_name = (
+                    f"{bbox_idx}-"
+                    f"{action_idx}-"
+                    f"{person_uid}-"
+                    f"{frame_idx}-"
+                    f"{clazz}-"
+                    f"{pid_str}-"
+                    f"{uai}-"
+                    f"{h}x{w}.png"
+                )
+
+                img_path = base_dir / rel_path / file_name
+                total += 1
+
+                if not img_path.exists():
+                    # podgląd pierwszych braków w valid
+                    if missing < 10 and split == "valid":
+                        print("Brak pliku:", img_path)
+                    missing += 1
+                    continue
+
+                '''
+                Klucz ID
+                Tożsamość ważna tylko w obrębie jednej akcji
+                Dlatego składamy:
+                    action_idx | person_uid
+                '''
+                key = f"{action_idx}|{person_uid}"
+                samples.append(
+                    (str(img_path), key, int(action_idx), clazz)
+                )
+
+        print(f"[{split}] klasy w JSON:", all_classes)
+        print(f"[{split}] total={total} missing={missing}")
+        print(f"[{split}] samples={len(samples)}")
 
         if not samples:
             raise RuntimeError(
@@ -340,9 +405,9 @@ class SoccerNetReID(Dataset):
 
         '''
         Remap klucza ID na int
-        "12|3456" -> 0
-        "12|7890" -> 1
-        itd
+            "12|3456" -> 0
+            "12|7890" -> 1
+            itd
         Wynik końcowy:
             items = (path, label_int, action_idx, clazz)
         '''
