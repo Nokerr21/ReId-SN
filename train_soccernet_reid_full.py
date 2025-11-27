@@ -305,6 +305,8 @@ class SoccerNetReID(Dataset):
             "Main_referee",
             "Side_referee",
             "Goalkeeper_team_unknown",
+            "Goalkeeper_team_left_unknown",
+            "Goalkeeper_team_right_unknown",
             "Player_team_unknown_1",
             "Player_team_unknown_2",
         }
