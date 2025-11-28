@@ -11,6 +11,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from torchvision import transforms
+from collections import Counter
+
 
 # import z pliku treningowego
 from train_soccernet_reid_full import (
@@ -133,10 +135,10 @@ class ReIDJSONSplit(Dataset):
                 missing += 1
                 continue
 
-            key = f"{action_idx}|{person_uid}"
             samples.append(
-                (str(img_path), key, int(action_idx))
+                (str(img_path), int(person_uid), int(action_idx))
             )
+
 
         print(
             f"[{split}:{group}] total={total} "
@@ -148,18 +150,22 @@ class ReIDJSONSplit(Dataset):
                 f"Brak próbek w {split}:{group} po filtracji"
             )
 
-        # remap key -> int label
-        label_to_int = {}
-        items = []
-        for path, key, act in samples:
-            if key not in label_to_int:
-                label_to_int[key] = len(label_to_int)
-            items.append((path, label_to_int[key], act))
-
-        self.items = items
-        self.labels = [y for _, y, _ in items]
-        self.actions = [a for *_, a in items]
+        self.items = samples
+        self.labels = [y for _, y, _ in samples]
+        self.actions = [a for *_, a in samples]
         self.tfm = build_eval_transform()
+
+        # ===== DEBUG rozkładu ID =====
+        cnt = Counter(self.labels)
+        vals = np.array(list(cnt.values()))
+        print(f"[{split}:{group}] N obrazów = {len(self.items)}")
+        print(f"[{split}:{group}] unikalnych ID = {len(cnt)}")
+        print(f"[{split}:{group}] średnia próbek na ID = {vals.mean():.2f}")
+        print(f"[{split}:{group}] min próbek na ID = {vals.min()}")
+        print(f"[{split}:{group}] max próbek na ID = {vals.max()}")
+        one_sample = (vals == 1).sum()
+        print(f"[{split}:{group}] ID z 1 próbką = {one_sample}")
+
 
     def __len__(self):
         return len(self.items)

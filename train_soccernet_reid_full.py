@@ -29,6 +29,7 @@ from pytorch_metric_learning.miners import (
     MultiSimilarityMiner,
 )
 from pytorch_metric_learning.distances import CosineSimilarity
+from pytorch_lightning.loggers import WandbLogger
 
 
 # ===================== CONFIG =====================
@@ -44,7 +45,7 @@ class CFG:
     num_workers = 4
 
     # epoki i lr
-    epochs = 20
+    epochs = 50
     lr = 3e-4  # Startowy lr dla AdamW
 
     # embedding i arch
@@ -868,6 +869,12 @@ def main():
 
     # logger CSV
     logger = CSVLogger("runs", name="reid_full")
+    # logger wandb
+    wandb_logger = WandbLogger(
+    project="SoccerNet-ReID",
+    name="run_resnet50d_ms",
+    log_model=True
+    )
 
     # precyzja dla MPS
     precision = CFG.precision
@@ -902,7 +909,7 @@ def main():
         enable_progress_bar=True,
         limit_val_batches=1.0,
         num_sanity_val_steps=2,
-        logger=logger,
+        logger=wandb_logger,
     )
     # start treningu
     trainer.fit(model, train_loader, val_loader)
